@@ -8,8 +8,16 @@ import {
   isHLSProvider,
   MediaPlayer,
   MediaProvider,
+  Menu,
+  RadioGroup,
+  SeekButton,
 } from '@vidstack/react';
-import { AirPlayIcon } from '@vidstack/react/icons';
+import {
+  AirPlayIcon,
+  CheckIcon,
+  SeekBackward10Icon,
+  SeekForward10Icon,
+} from '@vidstack/react/icons';
 import {
   defaultLayoutIcons,
   DefaultVideoLayout,
@@ -20,9 +28,6 @@ import { useSearchParams } from 'next/navigation';
 import { Suspense } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import React from 'react';
-
-// 根据环境变量决定是否禁用去广告 Loader，默认 false
-const DISABLE_BLOCKAD = process.env.NEXT_PUBLIC_DISABLE_BLOCKAD === 'true';
 
 import 'vidstack/styles/defaults.css';
 import '@vidstack/react/player/styles/default/theme.css';
@@ -36,24 +41,17 @@ import {
   savePlayRecord,
   toggleFavorite,
 } from '@/lib/db.client';
-import { type VideoDetail, fetchVideoDetail } from '@/lib/fetchVideoDetail';
+import {
+  type VideoDetail,
+  fetchVideoDetail,
+} from '@/lib/fetchVideoDetail.client';
+import { SearchResult } from '@/lib/types';
 
 // 扩展 HTMLVideoElement 类型以支持 hls 属性
 declare global {
   interface HTMLVideoElement {
     hls?: any;
   }
-}
-
-// 搜索结果类型
-interface SearchResult {
-  id: string;
-  title: string;
-  poster: string;
-  episodes: string[];
-  source: string;
-  source_name: string;
-  year: string;
 }
 
 function PlayPageClient() {
@@ -85,7 +83,58 @@ function PlayPageClient() {
   const [showShortcutHint, setShowShortcutHint] = useState(false);
   const [shortcutText, setShortcutText] = useState('');
   const [shortcutDirection, setShortcutDirection] = useState('');
+  const [reverseEpisodeOrder, setReverseEpisodeOrder] = useState(false);
   const shortcutHintTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // NEW STATE: 控制快进/快退按钮是否显示
+  const [showSkipButtons, setShowSkipButtons] = useState(true);
+
+  // 使用 ResizeObserver 根据 MediaPlayer 元素尺寸动态决定按钮显隐
+  useEffect(() => {
+    if (
+      typeof window === 'undefined' ||
+      typeof ResizeObserver === 'undefined'
+    ) {
+      return;
+    }
+
+    const updateShowSkipButtons = () => {
+      const el: HTMLElement | undefined = (playerRef.current as any)?.el;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      // width < 576 或 height < 380 时隐藏
+      setShowSkipButtons(!(rect.width < 576 || rect.height < 380));
+    };
+
+    // 尝试立即更新一次
+    updateShowSkipButtons();
+
+    const observer = new ResizeObserver(updateShowSkipButtons);
+    // 有可能此时 el 还未就绪，使用轮询确保绑定
+    let retryTimer: NodeJS.Timeout | null = null;
+    const attachObserver = () => {
+      const el: HTMLElement | undefined = (playerRef.current as any)?.el;
+      if (el) {
+        observer.observe(el);
+        if (retryTimer) clearInterval(retryTimer);
+      }
+    };
+
+    attachObserver();
+    if (!(playerRef.current as any)?.el) {
+      // 如果首次未获取到 el，继续重试直至获取
+      retryTimer = setInterval(attachObserver, 200);
+    }
+
+    // orientationchange 也可能影响高/宽
+    window.addEventListener('orientationchange', updateShowSkipButtons);
+
+    return () => {
+      observer.disconnect();
+      if (retryTimer) clearInterval(retryTimer);
+      window.removeEventListener('orientationchange', updateShowSkipButtons);
+    };
+  }, []);
 
   // 换源相关状态
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -116,13 +165,6 @@ function PlayPageClient() {
   );
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // 长按三倍速相关状态
-  const [isLongPressing, setIsLongPressing] = useState(false);
-  const [showSpeedTip, setShowSpeedTip] = useState(false);
-  const longPressTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const originalPlaybackRateRef = useRef<number>(1);
-  const speedTipTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
   // 用于记录是否需要在播放器 ready 后跳转到指定进度
   const resumeTimeRef = useRef<number | null>(null);
 
@@ -141,6 +183,21 @@ function PlayPageClient() {
 
   // 上次使用的音量，默认 0.7
   const lastVolumeRef = useRef<number>(0.7);
+
+  // 新增：去广告开关（从 localStorage 继承，默认 true）
+  const [blockAdEnabled, _setBlockAdEnabled] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const v = localStorage.getItem('enable_blockad');
+      if (v !== null) return v === 'true';
+    }
+    return true;
+  });
+
+  // 长按三倍速相关
+  const longPressTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const normalPlaybackRateRef = useRef<number>(1);
+  // 标记长按是否已生效
+  const longPressActiveRef = useRef<boolean>(false);
 
   // 同步最新值到 refs
   useEffect(() => {
@@ -222,7 +279,7 @@ function PlayPageClient() {
         const detailData = await fetchVideoDetail({
           source: currentSource,
           id: currentId,
-          fallbackTitle: videoTitle,
+          fallbackTitle: videoTitle.trim(),
           fallbackYear: videoYear,
         });
 
@@ -345,6 +402,10 @@ function PlayPageClient() {
         }
       }, 0);
     }
+
+    // 绑定长按三倍速事件
+    playerRef.current?.addEventListener('touchstart', handleLongPressStart);
+    playerRef.current?.addEventListener('touchend', handleLongPressEnd);
   };
 
   const onEnded = () => {
@@ -406,9 +467,6 @@ function PlayPageClient() {
       }
       if (longPressTimeoutRef.current) {
         clearTimeout(longPressTimeoutRef.current);
-      }
-      if (speedTipTimeoutRef.current) {
-        clearTimeout(speedTipTimeoutRef.current);
       }
     };
   }, []);
@@ -478,7 +536,7 @@ function PlayPageClient() {
 
     try {
       const response = await fetch(
-        `/api/search?q=${encodeURIComponent(query)}`
+        `/api/search?q=${encodeURIComponent(query.trim())}`
       );
       if (!response.ok) {
         throw new Error('搜索失败');
@@ -510,7 +568,12 @@ function PlayPageClient() {
             result.title.toLowerCase() === videoTitle.toLowerCase() &&
             (videoYear
               ? result.year.toLowerCase() === videoYear.toLowerCase()
-              : true)
+              : true) &&
+            detailRef.current?.episodes.length &&
+            ((detailRef.current?.episodes.length === 1 &&
+              result.episodes.length === 1) ||
+              (detailRef.current?.episodes.length > 1 &&
+                result.episodes.length > 1))
         );
 
         if (exactMatch) {
@@ -556,7 +619,7 @@ function PlayPageClient() {
       const newDetail = await fetchVideoDetail({
         source: newSource,
         id: newId,
-        fallbackTitle: newTitle,
+        fallbackTitle: newTitle.trim(),
         fallbackYear: videoYear,
       });
 
@@ -863,12 +926,7 @@ function PlayPageClient() {
   // 用户点击悬浮按钮 -> 请求全屏并锁定横屏
   const handleForceLandscape = async () => {
     try {
-      const el: any = document.documentElement;
-      if (el.requestFullscreen) {
-        await el.requestFullscreen();
-      } else if (el.webkitRequestFullscreen) {
-        el.webkitRequestFullscreen();
-      }
+      playerRef.current?.enterFullscreen();
 
       if (screen.orientation && (screen.orientation as any).lock) {
         await (screen.orientation as any).lock('landscape');
@@ -951,124 +1009,25 @@ function PlayPageClient() {
     };
   }, []);
 
-  // 长按三倍速处理函数
-  const handleTouchStart = (e: TouchEvent) => {
-    // 防止在控制栏区域触发
-    const target = e.target as HTMLElement;
-    if (
-      target.closest('.vds-controls') ||
-      target.closest('.vds-context-menu') ||
-      target.closest('.vds-lazy-gesture')
-    ) {
-      return;
-    }
-
-    // 仅在播放时触发
-    if (!playerRef.current?.playing) {
-      return;
-    }
-
-    // 清除之前的定时器
-    if (longPressTimeoutRef.current) {
-      clearTimeout(longPressTimeoutRef.current);
-    }
-
-    // 设置长按检测定时器（500ms）
-    longPressTimeoutRef.current = setTimeout(() => {
-      if (playerRef.current) {
-        // 保存原始播放速度
-        originalPlaybackRateRef.current = playerRef.current.playbackRate;
-
-        // 设置三倍速
-        playerRef.current.playbackRate = 3;
-
-        // 更新状态
-        setIsLongPressing(true);
-        setShowSpeedTip(true);
-
-        // 触发震动反馈（如果支持）
-        if (navigator.vibrate) {
-          navigator.vibrate(50);
-        }
-
-        // 3秒后自动隐藏提示
-        if (speedTipTimeoutRef.current) {
-          clearTimeout(speedTipTimeoutRef.current);
-        }
-        speedTipTimeoutRef.current = setTimeout(() => {
-          setShowSpeedTip(false);
-        }, 3000);
-      }
-    }, 500);
-  };
-
-  const handleTouchEnd = () => {
-    // 清除长按检测定时器
-    if (longPressTimeoutRef.current) {
-      clearTimeout(longPressTimeoutRef.current);
-      longPressTimeoutRef.current = null;
-    }
-
-    // 如果正在长按，恢复原始播放速度
-    if (isLongPressing && playerRef.current) {
-      playerRef.current.playbackRate = originalPlaybackRateRef.current;
-      setIsLongPressing(false);
-      setShowSpeedTip(false);
-
-      // 清除提示定时器
-      if (speedTipTimeoutRef.current) {
-        clearTimeout(speedTipTimeoutRef.current);
-        speedTipTimeoutRef.current = null;
-      }
-    }
-  };
-
-  // 添加触摸事件监听器
-  useEffect(() => {
-    const playerEl = playerRef.current?.el;
-    if (!playerEl) return;
-
-    const disableContextMenu = (e: Event) => {
-      e.preventDefault();
-      e.stopPropagation();
-    };
-
-    playerEl.addEventListener('touchstart', handleTouchStart, {
-      passive: true,
-    });
-    playerEl.addEventListener('touchend', handleTouchEnd, { passive: true });
-    playerEl.addEventListener('touchcancel', handleTouchEnd, { passive: true });
-    playerEl.addEventListener('contextmenu', disableContextMenu);
-
-    return () => {
-      playerEl.removeEventListener('touchstart', handleTouchStart);
-      playerEl.removeEventListener('touchend', handleTouchEnd);
-      playerEl.removeEventListener('touchcancel', handleTouchEnd);
-      playerEl.removeEventListener('contextmenu', disableContextMenu);
-    };
-  }, [playerRef.current, isLongPressing]);
-
   /* -------------------- 设置 meta theme-color 为纯黑 -------------------- */
   useEffect(() => {
-    if (typeof document === 'undefined') return;
+    const originalThemeColorTags = Array.from(
+      document.querySelectorAll('meta[name="theme-color"]')
+    );
 
-    // 查找或创建 meta[name="theme-color"]
-    let metaTag = document.querySelector(
-      'meta[name="theme-color"]'
-    ) as HTMLMetaElement | null;
+    // 移除已有的 theme-color 标签
+    originalThemeColorTags.forEach((tag) => tag.remove());
 
-    if (!metaTag) {
-      metaTag = document.createElement('meta');
-      metaTag.setAttribute('name', 'theme-color');
-      document.head.appendChild(metaTag);
-    }
+    // 添加播放页专用的 theme-color 标签
+    const playerThemeColorTag = document.createElement('meta');
+    playerThemeColorTag.name = 'theme-color';
+    playerThemeColorTag.content = '#000000';
+    document.head.appendChild(playerThemeColorTag);
 
-    // 记录原始颜色，并设置为纯黑
-    metaTag.setAttribute('content', '#000000');
-
-    // 卸载时恢复
+    // 组件卸载时恢复原有的 theme-color 标签
     return () => {
-      metaTag?.setAttribute('content', '#e6f3fb');
+      playerThemeColorTag.remove();
+      originalThemeColorTags.forEach((tag) => document.head.appendChild(tag));
     };
   }, []);
 
@@ -1080,6 +1039,44 @@ function PlayPageClient() {
     const v = playerRef.current?.volume;
     if (typeof v === 'number' && !Number.isNaN(v)) {
       lastVolumeRef.current = v;
+    }
+  };
+
+  // 长按三倍速处理
+  const handleLongPressStart = (e: TouchEvent) => {
+    if (playerRef.current?.paused || playerRef.current?.playbackRate === 3.0) {
+      return;
+    }
+    const target = e.target as HTMLElement;
+    if (
+      target.closest('.custom_topbar') ||
+      target.closest('.custom_episodes_panel') ||
+      target.closest('.custom_source_panel')
+    ) {
+      return;
+    }
+    if (longPressTimeoutRef.current) {
+      clearTimeout(longPressTimeoutRef.current);
+    }
+    longPressTimeoutRef.current = setTimeout(() => {
+      if (playerRef.current) {
+        normalPlaybackRateRef.current = playerRef.current.playbackRate || 1;
+        playerRef.current.playbackRate = 3.0;
+        longPressActiveRef.current = true; // 记录长按已激活
+        displayShortcutHint('3倍速', 'play');
+      }
+    }, 300); // 按压 300ms 触发
+  };
+
+  const handleLongPressEnd = () => {
+    if (longPressTimeoutRef.current) {
+      clearTimeout(longPressTimeoutRef.current);
+      longPressTimeoutRef.current = null;
+    }
+    // 只有在长按激活过且当前倍速为 3.0 时才恢复，防止误触
+    if (playerRef.current && longPressActiveRef.current) {
+      playerRef.current.playbackRate = normalPlaybackRateRef.current || 1;
+      longPressActiveRef.current = false;
     }
   };
 
@@ -1103,10 +1100,18 @@ function PlayPageClient() {
           </div>
           <div className='text-base mb-6'>{error}</div>
           <button
-            onClick={() => window.history.back()}
+            onClick={() => {
+              if (videoTitle) {
+                window.location.href = `/aggregate?q=${encodeURIComponent(
+                  videoTitle.trim()
+                )}${videoYear ? `&year=${encodeURIComponent(videoYear)}` : ''}`;
+              } else {
+                window.location.href = '/';
+              }
+            }}
             className='px-6 py-2 bg-blue-500 hover:bg-blue-600 rounded-lg transition-colors'
           >
-            返回
+            {videoTitle ? '返回选源' : '返回首页'}
           </button>
         </div>
       </div>
@@ -1119,10 +1124,19 @@ function PlayPageClient() {
         <div className='text-white text-center'>
           <div className='text-xl font-semibold mb-4'>未找到视频</div>
           <button
-            onClick={() => window.history.back()}
+            onClick={() => {
+              // 返回选源页
+              if (videoTitle) {
+                window.location.href = `/aggregate?q=${encodeURIComponent(
+                  videoTitle.trim()
+                )}${videoYear ? `&year=${encodeURIComponent(videoYear)}` : ''}`;
+              } else {
+                window.location.href = '/';
+              }
+            }}
             className='px-6 py-2 bg-blue-500 hover:bg-blue-600 rounded-lg transition-colors'
           >
-            返回
+            {videoTitle ? '返回选源' : '返回首页'}
           </button>
         </div>
       </div>
@@ -1137,7 +1151,6 @@ function PlayPageClient() {
     sourceName,
     onToggleFavorite,
     onOpenSourcePanel,
-    isFullscreen,
   }: {
     videoTitle: string;
     favorited: boolean;
@@ -1146,39 +1159,38 @@ function PlayPageClient() {
     sourceName: string;
     onToggleFavorite: () => void;
     onOpenSourcePanel: () => void;
-    isFullscreen: boolean;
   }) => {
     return (
       <div
         data-top-bar
-        className='absolute top-0 left-0 right-0 transition-opacity duration-300 z-10 opacity-0 pointer-events-none group-data-[controls]:opacity-100 group-data-[controls]:pointer-events-auto'
+        className='absolute custom_topbar top-0 left-0 right-0 transition-opacity duration-300 z-10 opacity-0 pointer-events-none group-data-[controls]:opacity-100 group-data-[controls]:pointer-events-auto'
       >
         <div className='bg-black/60 backdrop-blur-sm px-0 sm:px-6 py-4 relative flex items-center sm:justify-center'>
           {/* 返回按钮 */}
-          {!isFullscreen && (
-            <button
-              onClick={() => {
-                if (playerRef.current?.fullscreen) {
-                  playerRef.current?.exitFullscreen();
-                }
-                window.history.back();
-              }}
-              className='absolute left-0 sm:left-6 text-white hover:text-gray-300 transition-colors p-2'
+          <button
+            onClick={() => {
+              // 如果当下是全屏状态，先退出全屏，而不是直接后退
+              if (isFullscreen) {
+                playerRef.current?.exitFullscreen();
+                return;
+              }
+              window.history.back();
+            }}
+            className='absolute vds-button left-0 sm:left-6 text-white hover:text-gray-300 transition-colors p-2'
+          >
+            <svg
+              width='24'
+              height='24'
+              viewBox='0 0 24 24'
+              fill='none'
+              xmlns='http://www.w3.org/2000/svg'
             >
-              <svg
-                width='24'
-                height='24'
-                viewBox='0 0 24 24'
-                fill='none'
-                xmlns='http://www.w3.org/2000/svg'
-              >
-                <path
-                  d='M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z'
-                  fill='currentColor'
-                />
-              </svg>
-            </button>
-          )}
+              <path
+                d='M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z'
+                fill='currentColor'
+              />
+            </svg>
+          </button>
 
           {/* 中央标题及集数信息 */}
           <div
@@ -1202,21 +1214,39 @@ function PlayPageClient() {
             </div>
 
             {totalEpisodes > 1 && (
-              <div className='text-gray-300 text-sm mt-0.5'>
+              <div
+                className='text-gray-300 text-sm mt-0.5 cursor-pointer'
+                onClick={() => {
+                  setShowEpisodePanel(true);
+                  playerContainerRef.current?.focus();
+                }}
+              >
                 第 {currentEpisodeIndex + 1} 集 / 共 {totalEpisodes} 集
               </div>
             )}
           </div>
 
-          {/* 数据源徽章放置在右侧，不影响标题居中 */}
-          {sourceName && (
-            <span
-              className='absolute right-2 sm:right-6 text-gray-300 text-sm border border-gray-500/60 px-2 py-[1px] rounded cursor-pointer hover:bg-gray-600/30 transition-colors'
-              onClick={onOpenSourcePanel}
-            >
-              {sourceName}
-            </span>
-          )}
+          <div className='absolute right-2 sm:right-6 flex flex-row items-center space-x-1'>
+            {totalEpisodes > 1 && (
+              <div
+                className='vds-button text-sm'
+                onClick={() => {
+                  setShowEpisodePanel(true);
+                  playerContainerRef.current?.focus();
+                }}
+              >
+                选集
+              </div>
+            )}
+            {sourceName && (
+              <span
+                className='text-gray-300 text-sm border border-gray-500/60 px-2 py-[1px] rounded cursor-pointer hover:bg-gray-600/30 transition-colors'
+                onClick={onOpenSourcePanel}
+              >
+                {sourceName}
+              </span>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -1272,24 +1302,6 @@ function PlayPageClient() {
         // 调用父类构造函数
         // @ts-ignore
         super(config);
-
-        // 监听 Hls 错误事件，捕获 bufferStalledError 并尝试跳过
-        this.on(Hls.Events.ERROR, (_evt: any, data: any) => {
-          if (
-            data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
-            data?.details === Hls.ErrorDetails.BUFFER_SEEK_OVER_HOLE
-          ) {
-            try {
-              const media = (this as any).media as HTMLMediaElement | undefined;
-              if (media && !media.seeking) {
-                // 前跳 1 秒，跳过当前卡顿的分片
-                media.currentTime = media.currentTime + 1;
-              }
-            } catch (err) {
-              console.warn('尝试跳过卡顿分片失败:', err);
-            }
-          }
-        });
       }
 
       attachMedia(media: HTMLMediaElement): void {
@@ -1310,7 +1322,7 @@ function PlayPageClient() {
         backBufferLength: 30, // 仅保留 30s 已播放内容，避免内存占用
         maxBufferSize: 60 * 1000 * 1000, // 约 60MB，超出后触发清理
         /* 自定义loader */
-        loader: DISABLE_BLOCKAD ? Hls.DefaultConfig.loader : CustomHlsJsLoader,
+        loader: blockAdEnabled ? CustomHlsJsLoader : Hls.DefaultConfig.loader,
       };
     }
   };
@@ -1375,18 +1387,8 @@ function PlayPageClient() {
           onClick={handleForceLandscape}
           className='fixed bottom-16 left-4 z-[85] w-10 h-10 rounded-full bg-gray-800 text-white flex items-center justify-center md:hidden'
         >
-          <svg
-            className='w-6 h-6'
-            fill='none'
-            stroke='currentColor'
-            viewBox='0 0 24 24'
-          >
-            <path
-              strokeLinecap='round'
-              strokeLinejoin='round'
-              strokeWidth={2}
-              d='M3 18v-6a3 3 0 013-3h12M21 6v6a3 3 0 01-3 3H6'
-            />
+          <svg className='w-5 h-5' viewBox='0 0 1024 1024' fill='currentColor'>
+            <path d='M298.666667 469.333333h597.333333c46.933333 0 85.333333 38.4 85.333333 85.333334v341.333333c0 46.933333-38.4 85.333333-85.333333 85.333333H298.666667c-46.933333 0-85.333333-38.4-85.333334-85.333333v-341.333333c0-46.933333 38.4-85.333333 85.333334-85.333334z m0 85.333334v341.333333h597.333333v-341.333333H298.666667z m170.666666-512c46.933333 0 85.333333 38.4 85.333334 85.333333v298.666667h-85.333334V128H128v597.333333h42.666667v85.333334H128c-46.933333 0-85.333333-38.4-85.333333-85.333334V128c0-46.933333 38.4-85.333333 85.333333-85.333333h341.333333z m115.2 42.666666c128 0 238.933333 89.6 268.8 213.333334v4.266666l46.933334-51.2L951.466667 298.666667 853.333333 396.8c-17.066667 21.333333-51.2 8.533333-55.466666-17.066667V366.933333c0-115.2-89.6-213.333333-204.8-217.6h-8.533334V85.333333z' />
           </svg>
         </button>
       )}
@@ -1431,55 +1433,85 @@ function PlayPageClient() {
           sourceName={detail?.source_name || ''}
           onToggleFavorite={handleToggleFavorite}
           onOpenSourcePanel={handleSourcePanelOpen}
-          isFullscreen={isFullscreen}
         />
         <DefaultVideoLayout
           icons={defaultLayoutIcons}
+          noScrubGesture={true}
           slots={{
             googleCastButton: null,
-            pipButton: null,
             settingsMenu: null,
-            muteButton: null, // 隐藏静音按钮
-            volumeSlider: null, // 隐藏音量条
+            captionButton: null,
+            // muteButton: null, // 隐藏静音按钮
+            // volumeSlider: null, // 隐藏音量条
             airPlayButton: null, // 隐藏默认 AirPlay 按钮
-            beforeCurrentTime:
-              totalEpisodes > 1 ? (
-                // 下一集按钮放在时间显示前
-                <button
-                  className='vds-button mr-2'
-                  onClick={handleNextEpisode}
-                  aria-label='Next Episode'
-                >
-                  <svg
-                    className='vds-icon'
-                    viewBox='0 0 32 32'
-                    xmlns='http://www.w3.org/2000/svg'
-                  >
-                    <path
-                      d='M6 24l12-8L6 8v16zM22 8v16h3V8h-3z'
-                      fill='currentColor'
-                    />
-                  </svg>
-                </button>
-              ) : null,
-            beforeFullscreenButton: (
+            beforeCurrentTime: (
               <>
                 {totalEpisodes > 1 && (
+                  // 下一集按钮放在时间显示前
                   <button
                     className='vds-button mr-2'
-                    onClick={() => {
-                      setShowEpisodePanel(true);
-                      playerContainerRef.current?.focus();
-                    }}
+                    onClick={handleNextEpisode}
+                    aria-label='Next Episode'
                   >
-                    选集
+                    <svg
+                      className='vds-icon'
+                      viewBox='0 0 32 32'
+                      xmlns='http://www.w3.org/2000/svg'
+                    >
+                      <path
+                        d='M6 24l12-8L6 8v16zM22 8v16h3V8h-3z'
+                        fill='currentColor'
+                      />
+                    </svg>
                   </button>
                 )}
-                <PlaybackRateButton playerRef={playerRef} />
+              </>
+            ),
+            beforeFullscreenButton: (
+              <>
+                <button
+                  className='vds-button'
+                  aria-label={blockAdEnabled ? '关闭去广告' : '开启去广告'}
+                  onClick={() => {
+                    const newVal = !blockAdEnabled;
+                    try {
+                      saveCurrentPlayProgress();
+                      localStorage.setItem('enable_blockad', String(newVal));
+                    } catch (_) {
+                      // ignore
+                    }
+                    window.location.reload();
+                  }}
+                >
+                  <AdBlockIcon enabled={blockAdEnabled} />
+                </button>
+                <PlaybackRateButton
+                  playerRef={playerRef}
+                  playerContainerRef={playerContainerRef}
+                />
                 {/* 自定义 AirPlay 按钮 */}
                 <AirPlayButton className='vds-button'>
                   <AirPlayIcon className='vds-icon' />
                 </AirPlayButton>
+              </>
+            ),
+            // 快退 10 秒按钮（根据播放器尺寸决定显隐）
+            beforePlayButton: (
+              <>
+                {showSkipButtons && (
+                  <SeekButton className='vds-button' seconds={-10}>
+                    <SeekBackward10Icon className='vds-icon' />
+                  </SeekButton>
+                )}
+              </>
+            ),
+            afterPlayButton: (
+              <>
+                {showSkipButtons && (
+                  <SeekButton className='vds-button' seconds={10}>
+                    <SeekForward10Icon className='vds-icon' />
+                  </SeekButton>
+                )}
               </>
             ),
           }}
@@ -1501,13 +1533,28 @@ function PlayPageClient() {
 
             {/* 侧拉面板 */}
             <div
-              className={`fixed top-0 right-0 h-full w-full mobile-landscape:w-1/2 md:w-80 bg-black/40 backdrop-blur-xl z-[110] transform transition-transform duration-300 ${
+              className={`fixed custom_episodes_panel top-0 right-0 h-full w-full mobile-landscape:w-1/2 md:w-80 bg-black/40 backdrop-blur-xl z-[110] transform transition-transform duration-300 ${
                 showEpisodePanel ? 'translate-x-0' : 'translate-x-full'
               }`}
             >
               <div className='p-6 h-full flex flex-col'>
                 <div className='flex items-center justify-between mb-6'>
-                  <h3 className='text-white text-xl font-semibold'>选集列表</h3>
+                  <div className='flex items-center gap-4'>
+                    <h3 className='text-white text-xl font-semibold'>
+                      选集列表
+                    </h3>
+                    {/* 倒序小字 */}
+                    <span
+                      onClick={() => setReverseEpisodeOrder((prev) => !prev)}
+                      className={`text-sm cursor-pointer select-none transition-colors ${
+                        reverseEpisodeOrder
+                          ? 'text-green-500'
+                          : 'text-gray-400 hover:text-gray-500'
+                      }`}
+                    >
+                      倒序
+                    </span>
+                  </div>
                   <button
                     onClick={() => {
                       setShowEpisodePanel(false);
@@ -1537,7 +1584,13 @@ function PlayPageClient() {
 
                 <div className='flex-1 overflow-y-auto'>
                   <div className='grid grid-cols-4 gap-3'>
-                    {Array.from({ length: totalEpisodes }, (_, idx) => (
+                    {(reverseEpisodeOrder
+                      ? Array.from(
+                          { length: totalEpisodes },
+                          (_, i) => i
+                        ).reverse()
+                      : Array.from({ length: totalEpisodes }, (_, i) => i)
+                    ).map((idx) => (
                       <button
                         key={idx}
                         onClick={() => handleEpisodeChange(idx)}
@@ -1572,7 +1625,7 @@ function PlayPageClient() {
 
           {/* 侧拉面板 */}
           <div
-            className={`fixed top-0 right-0 h-full w-full mobile-landscape:w-1/2 md:w-96 bg-black/40 backdrop-blur-xl z-[110] transform transition-transform duration-300 ${
+            className={`fixed custom_source_panel top-0 right-0 h-full w-full mobile-landscape:w-1/2 md:w-96 bg-black/40 backdrop-blur-xl z-[110] transform transition-transform duration-300 ${
               showSourcePanel ? 'translate-x-0' : 'translate-x-full'
             }`}
           >
@@ -1782,30 +1835,6 @@ function PlayPageClient() {
             <span className='text-white font-medium'>{shortcutText}</span>
           </div>
         </div>
-
-        {/* 三倍速提示 */}
-        <div
-          className={`absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-50 transition-opacity duration-300 ${
-            showSpeedTip ? 'opacity-100' : 'opacity-0 pointer-events-none'
-          }`}
-        >
-          <div className='bg-black/60 backdrop-blur-sm rounded-lg p-4 flex items-center space-x-3'>
-            <svg
-              className='w-6 h-6 text-white animate-pulse'
-              fill='none'
-              stroke='currentColor'
-              viewBox='0 0 24 24'
-            >
-              <path
-                strokeLinecap='round'
-                strokeLinejoin='round'
-                strokeWidth='2'
-                d='M13 10V3L4 14h7v7l9-11h-7z'
-              />
-            </svg>
-            <span className='text-white font-bold text-lg'>3x 倍速</span>
-          </div>
-        </div>
       </MediaPlayer>
     </div>
   );
@@ -1813,8 +1842,10 @@ function PlayPageClient() {
 
 const PlaybackRateButton = ({
   playerRef,
+  playerContainerRef,
 }: {
   playerRef: React.RefObject<any>;
+  playerContainerRef: React.RefObject<HTMLDivElement>;
 }) => {
   const [rate, setRate] = useState(1);
   const rates = [0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
@@ -1829,18 +1860,38 @@ const PlaybackRateButton = ({
     return unsubscribe;
   }, [playerRef]);
 
-  const cycleRate = () => {
-    const player = playerRef.current;
-    if (!player) return;
-    const currentIndex = rates.indexOf(rate);
-    const nextIndex = (currentIndex + 1) % rates.length;
-    player.playbackRate = rates[nextIndex];
-  };
-
   return (
-    <button className='vds-button mr-2' onClick={cycleRate}>
-      {rate === 1 ? '倍速' : `${rate.toFixed(2)}x`}
-    </button>
+    <Menu.Root className='vds-menu'>
+      <Menu.Button className='vds-menu-button vds-button' aria-label='Settings'>
+        <span>倍速</span>
+      </Menu.Button>
+      <Menu.Items className='vds-menu-items' placement='top' offset={0}>
+        <RadioGroup.Root
+          className='vds-radio-group'
+          aria-label='Custom Options'
+          value={rate.toString()}
+          onChange={(value: string) => {
+            const player = playerRef.current;
+            if (!player) {
+              return;
+            }
+            player.playbackRate = Number(value);
+            playerContainerRef.current?.focus();
+          }}
+        >
+          {[...rates].reverse().map((rate) => (
+            <RadioGroup.Item
+              className='vds-radio'
+              value={rate.toString()}
+              key={rate}
+            >
+              <CheckIcon className='vds-icon' />
+              <span className='vds-radio-label'>{rate}</span>
+            </RadioGroup.Item>
+          ))}
+        </RadioGroup.Root>
+      </Menu.Items>
+    </Menu.Root>
   );
 };
 
@@ -1853,7 +1904,7 @@ const FavoriteIcon = ({ filled }: { filled: boolean }) => {
         xmlns='http://www.w3.org/2000/svg'
       >
         <path
-          d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'
+          d='M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z'
           fill='#ef4444' /* Tailwind red-500 */
           stroke='#ef4444'
           strokeWidth='2'
@@ -1864,6 +1915,41 @@ const FavoriteIcon = ({ filled }: { filled: boolean }) => {
     );
   }
   return <Heart className='h-5 w-5 stroke-[2] text-gray-300' />;
+};
+
+// 新增：去广告图标组件
+const AdBlockIcon = ({ enabled }: { enabled: boolean }) => {
+  return (
+    <svg
+      className='h-6 w-6 vds-icon' // 略微放大尺寸
+      viewBox='0 0 32 32'
+      xmlns='http://www.w3.org/2000/svg'
+    >
+      {/* "AD" 文字，居中显示 */}
+      <text
+        x='50%'
+        y='50%'
+        fontSize='20'
+        fontWeight='bold'
+        textAnchor='middle'
+        dominantBaseline='middle'
+        fill='#ffffff'
+      >
+        AD
+      </text>
+      {enabled && (
+        <line
+          x1='4'
+          y1='4'
+          x2='28'
+          y2='28'
+          stroke='#ffffff'
+          strokeWidth='4'
+          strokeLinecap='round'
+        />
+      )}
+    </svg>
+  );
 };
 
 export default function PlayPage() {
